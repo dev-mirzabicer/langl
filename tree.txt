@@ -1,0 +1,1043 @@
+.
+  db.py
+    -- File Content --
+    # db.py
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from config import Config
+    from models import Base
+    
+    class DBService:
+    def __init__(self):
+    self.engine = create_engine(Config.SQLALCHEMY_DATABASE_URI, echo=Config.SQLALCHEMY_ECHO)
+    self.SessionLocal = sessionmaker(bind=self.engine)
+    
+    def create_tables(self):
+    """
+    Creates all tables in the database. Should be called once at startup.
+    """
+    Base.metadata.create_all(self.engine)
+    
+    def get_session(self):
+    """
+    Provides a new SQLAlchemy session. Caller is responsible for closing it.
+    """
+    return self.SessionLocal()
+    ---
+  models.py
+    -- File Content --
+    # models.py
+    from sqlalchemy import (
+    Column,
+    String,
+    Integer,
+    Float,
+    DateTime,
+    ForeignKey,
+    ForeignKeyConstraint,
+    )
+    from sqlalchemy.orm import declarative_base, relationship
+    from datetime import datetime
+    
+    Base = declarative_base()
+    
+    
+    class Vocabulary(Base):
+    """
+    Represents a single word in the user's vocabulary, with FSRS data attached.
+    """
+    
+    __tablename__ = "user_vocabulary"
+    
+    word = Column(String, primary_key=True)
+    language = Column(String, primary_key=True)
+    translation = Column(String, nullable=True)
+    
+    # FSRS fields
+    state = Column(
+    Integer, nullable=False, default=1
+    )  # 1=Learning, 2=Review, 3=Relearning
+    due = Column(DateTime, nullable=True)
+    stability = Column(Float, nullable=True)  # Changed: Allow NULL, removed default
+    difficulty = Column(Float, nullable=True)  # Changed: Allow NULL, removed default
+    last_review = Column(DateTime, nullable=True, default=None)
+    step = Column(Integer, default=0)
+    
+    # Relationships
+    reviews = relationship(
+    "ReviewHistory", back_populates="vocabulary", cascade="all, delete-orphan"
+    )
+    
+    
+    class ReviewHistory(Base):
+    """
+    Detailed logs for each review event, used for FSRS optimization or analytics.
+    """
+    
+    __tablename__ = "review_history"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    review_time = Column(DateTime, nullable=False, default=datetime.utcnow)
+    word = Column(String, nullable=False)
+    language = Column(String, nullable=False)
+    rating = Column(Integer, nullable=False)  # 1=Again, 2=Hard, 3=Good, 4=Easy
+    state = Column(Integer, nullable=True)  # 1=Learning, 2=Review, 3=Relearning
+    
+    # Composite Foreign Key Constraint
+    __table_args__ = (
+    ForeignKeyConstraint(
+    ["word", "language"], ["user_vocabulary.word", "user_vocabulary.language"]
+    ),
+    )
+    
+    # Relationships
+    vocabulary = relationship(
+    "Vocabulary", back_populates="reviews", foreign_keys=[word, language]
+    )
+    
+    
+    class WordList(Base):
+    """
+    Stores initial words (like A1, A2 lists) for import.
+    """
+    
+    __tablename__ = "word_lists"
+    language = Column(String, primary_key=True)
+    level = Column(String, primary_key=True)
+    word = Column(String, primary_key=True)
+    ---
+  alignment.py
+    -- File Content --
+    # alignment.py
+    from simalign import SentenceAligner
+    import nltk
+    
+    
+    class AlignmentService:
+    def __init__(self, model_name="bert", token_type="bpe", matching_methods="mai"):
+    self.aligner = SentenceAligner(
+    model=model_name, token_type=token_type, matching_methods=matching_methods
+    )
+    self.cache = {}
+    
+    def align(self, original: str, translated: str):
+    """
+    Returns alignment data:
+    {
+    'src_tokenized': [...],
+    'trg_tokenized': [...],
+    'alignment': [(src_idx, trg_idx), ...]
+    }
+    """
+    if not original or not translated:
+    return {"src_tokenized": [], "trg_tokenized": [], "alignment": []}
+    
+    cache_key = (original, translated)
+    if cache_key in self.cache:
+    return self.cache[cache_key]
+    
+    # Tokenize sentences using nltk for consistency
+    src_tokens = nltk.word_tokenize(original)
+    trg_tokens = nltk.word_tokenize(translated)
+    
+    # Perform alignment
+    try:
+    alignments = self.aligner.get_word_aligns(src_tokens, trg_tokens)
+    except Exception as e:
+    raise RuntimeError(f"Alignment failed: {str(e)}")
+    
+    # print(src_tokens, trg_tokens, alignments, sep="\n")
+    
+    alignment_data = {
+    "src_tokenized": src_tokens,
+    "trg_tokenized": trg_tokens,
+    "alignment": list(alignments["mwmf"]),  # Convert set to list
+    }
+    
+    # Cache the result
+    self.cache[cache_key] = alignment_data
+    return alignment_data
+    ---
+  vocabulary_lookup.py
+    -- File Content --
+    # vocabulary_lookup.py
+    from nltk.stem import WordNetLemmatizer
+    from db import DBService
+    from sqlalchemy.orm import Session
+    
+    
+    class VocabularyLookupService:
+    def __init__(self, db_service: DBService):
+    self.db_service = db_service
+    self.lemmatizer = WordNetLemmatizer()
+    
+    def lookup_word(self, word: str, language: str):
+    session: Session = self.db_service.get_session()
+    try:
+    from models import Vocabulary
+    
+    # Direct match (case-insensitive)
+    direct_match = (
+    session.query(Vocabulary)
+    .filter(
+    Vocabulary.word.ilike(word), Vocabulary.language.ilike(language)
+    )
+    .first()
+    )
+    
+    if direct_match:
+    return {
+    "original_word": word,
+    "found_in_vocabulary": True,
+    "match_type": "direct",
+    "vocabulary_entry": {
+    "word": direct_match.word,
+    "language": direct_match.language,
+    "translation": direct_match.translation,
+    "state": direct_match.state,
+    "due": (
+    direct_match.due.isoformat() if direct_match.due else None
+    ),
+    "stability": direct_match.stability,
+    "difficulty": direct_match.difficulty,
+    "last_review": (
+    direct_match.last_review.isoformat()
+    if direct_match.last_review
+    else None
+    ),
+    "step": direct_match.step,
+    },
+    }
+    
+    # Lemmatization match
+    lemma = self.lemmatizer.lemmatize(word.lower())
+    lemma_match = (
+    session.query(Vocabulary)
+    .filter(
+    Vocabulary.word.ilike(lemma), Vocabulary.language.ilike(language)
+    )
+    .first()
+    )
+    
+    if lemma_match:
+    return {
+    "original_word": word,
+    "found_in_vocabulary": True,
+    "match_type": "lemma",
+    "vocabulary_entry": {
+    "word": lemma_match.word,
+    "language": lemma_match.language,
+    "translation": lemma_match.translation,
+    "state": lemma_match.state,
+    "due": lemma_match.due.isoformat() if lemma_match.due else None,
+    "stability": lemma_match.stability,
+    "difficulty": lemma_match.difficulty,
+    "last_review": (
+    lemma_match.last_review.isoformat()
+    if lemma_match.last_review
+    else None
+    ),
+    "step": lemma_match.step,
+    },
+    }
+    
+    # No match found
+    return {
+    "original_word": word,
+    "found_in_vocabulary": False,
+    "match_type": "none",
+    "vocabulary_entry": None,
+    }
+    except Exception as e:
+    # Log the exception as needed
+    print(f"Error during vocabulary lookup: {str(e)}")
+    return {
+    "original_word": word,
+    "found_in_vocabulary": False,
+    "match_type": "error",
+    "vocabulary_entry": None,
+    }
+    finally:
+    session.close()
+    ---
+  language_app.db
+    -- File Content --
+    [Binary File - Content Not Displayed]
+  app_fsrs.py
+    -- File Content --
+    # fsrs.py
+    from fsrs import Scheduler, Card, Rating, State
+    from datetime import datetime, timezone
+    from models import Vocabulary, ReviewHistory, WordList
+    from sqlalchemy.orm import Session
+    from sqlalchemy import and_
+    from flask import current_app
+    
+    
+    class FSRS_Service:
+    def __init__(self, db_service):
+    self.db_service = db_service
+    self.scheduler = Scheduler()  # Load custom parameters here if needed
+    
+    def add_word(self, word: str, language: str, translation: str = ""):
+    """
+    Adds a new word to the database as a new FSRS card if it doesn't exist.
+    """
+    session: Session = self.db_service.get_session()
+    try:
+    # Normalize to lowercase
+    word_lower = word.lower()
+    lang_lower = language.lower()
+    
+    existing = session.get(Vocabulary, (word_lower, lang_lower))
+    if existing:
+    # Word already in vocab; optionally we update translation if it's empty
+    if not existing.translation and translation:
+    existing.translation = translation.lower()
+    session.commit()
+    return
+    
+    # If no translation is provided, let's fetch it from dictionary
+    final_translation = translation.strip().lower()
+    if not final_translation:
+    # We'll call the dictionary logic directly or reuse the translation service
+    try:
+    fetched = current_app.translation_service.translate(
+    word, source_lang=language.upper(), target_lang="EN"
+    )
+    final_translation = fetched.lower()
+    except Exception as e:
+    print(f"Warning: Could not fetch translation: {str(e)}")
+    final_translation = ""
+    
+    # Create a new FSRS card
+    card = Card()
+    
+    # Initialize Vocabulary entry without setting stability and difficulty
+    vocab = Vocabulary(
+    word=word_lower,
+    language=lang_lower,
+    translation=final_translation if final_translation else None,
+    state=State.Learning.value,  # 1
+    step=0,
+    stability=None,  # Changed: Do not set, let FSRS initialize
+    difficulty=None,  # Changed: Do not set, let FSRS initialize
+    last_review=None,  # Never reviewed yet
+    due=datetime.now(timezone.utc),  # Due immediately for first review
+    )
+    session.add(vocab)
+    session.commit()
+    finally:
+    session.close()
+    
+    def review_word(self, word: str, language: str, user_rating: str):
+    """
+    Updates the FSRS card data for a word based on the user's rating.
+    user_rating can be: "again", "hard", "good", "easy"
+    Returns the updated Vocabulary object or None if not found.
+    """
+    rating_map = {
+    "again": Rating.Again,
+    "hard": Rating.Hard,
+    "good": Rating.Good,
+    "easy": Rating.Easy,
+    }
+    rating_key = user_rating.lower().strip()
+    rating = rating_map.get(rating_key)
+    if not rating:
+    raise ValueError(
+    f"Invalid user rating '{user_rating}'. Must be one of: again, hard, good, easy"
+    )
+    
+    now = datetime.now(timezone.utc)
+    
+    session: Session = self.db_service.get_session()
+    try:
+    vocab = (
+    session.query(Vocabulary)
+    .filter(
+    and_(
+    Vocabulary.word == word.lower(),
+    Vocabulary.language == language.lower(),
+    )
+    )
+    .first()
+    )
+    if not vocab:
+    return None
+    
+    # Ensure stability and difficulty are not negative if they are already set
+    if vocab.stability is not None and vocab.stability < 0.0001:
+    vocab.stability = 0.0001
+    
+    if vocab.difficulty is not None and vocab.difficulty < 0.0001:
+    vocab.difficulty = 0.0001
+    
+    # Recreate FSRS Card from Vocabulary data
+    card = Card(
+    state=State(vocab.state),
+    due=vocab.due,
+    stability=vocab.stability,
+    difficulty=vocab.difficulty,
+    last_review=vocab.last_review,
+    step=vocab.step,
+    )
+    
+    # Update the card with the user's rating
+    updated_card, review_log = self.scheduler.review_card(card, rating, now)
+    
+    # Prevent math domain errors if stability ended up <= 0
+    if updated_card.stability is not None and updated_card.stability <= 0:
+    updated_card.stability = 0.0001
+    
+    # Update Vocabulary with updated Card data
+    vocab.state = updated_card.state.value
+    vocab.due = updated_card.due
+    vocab.stability = updated_card.stability
+    vocab.difficulty = updated_card.difficulty
+    vocab.last_review = updated_card.last_review
+    vocab.step = updated_card.step
+    
+    # Log the review in ReviewHistory
+    rh = ReviewHistory(
+    review_time=now,
+    word=word.lower(),
+    language=language.lower(),
+    rating=rating.value,
+    state=updated_card.state.value,
+    )
+    session.add(rh)
+    session.commit()
+    return vocab
+    finally:
+    session.close()
+    
+    def get_words_due_for_review(self):
+    """
+    Returns all Vocabulary items whose due date is <= now
+    """
+    now = datetime.now(timezone.utc)
+    session: Session = self.db_service.get_session()
+    try:
+    results = session.query(Vocabulary).filter(Vocabulary.due <= now).all()
+    
+    return [
+    {"word": v.word, "language": v.language, "translation": v.translation}
+    for v in results
+    ]
+    finally:
+    session.close()
+    
+    def import_word_list(self, language: str, level: str, words: list[str]):
+    """
+    Inserts words into WordList, ignoring duplicates.
+    """
+    session: Session = self.db_service.get_session()
+    try:
+    for w in words:
+    w_lower = w.lower()
+    existing = (
+    session.query(WordList)
+    .filter(
+    and_(
+    WordList.language == language.lower(),
+    WordList.level == level.upper(),
+    WordList.word == w_lower,
+    )
+    )
+    .first()
+    )
+    if not existing:
+    wl = WordList(
+    language=language.lower(), level=level.upper(), word=w_lower
+    )
+    session.add(wl)
+    session.commit()
+    finally:
+    session.close()
+    
+    def get_learning_list(self, language: str, level: str):
+    """
+    Returns all words from WordList for the given language & level.
+    """
+    session: Session = self.db_service.get_session()
+    try:
+    rows = (
+    session.query(WordList)
+    .filter_by(language=language.lower(), level=level.upper())
+    .all()
+    )
+    
+    return [r.word for r in rows]
+    finally:
+    session.close()
+    
+    def get_all_vocabulary(self):
+    """
+    Returns all vocab entries from user_vocabulary with FSRS fields in dictionary form.
+    """
+    session: Session = self.db_service.get_session()
+    try:
+    rows = session.query(Vocabulary).all()
+    output = []
+    for v in rows:
+    output.append(
+    {
+    "word": v.word,
+    "language": v.language,
+    "translation": v.translation,
+    "state": v.state,
+    "due": v.due.isoformat() if v.due else None,
+    "stability": v.stability,
+    "difficulty": v.difficulty,
+    "last_review": (
+    v.last_review.isoformat() if v.last_review else None
+    ),
+    "step": v.step,
+    }
+    )
+    return output
+    finally:
+    session.close()
+    ---
+  translation.py
+    -- File Content --
+    # translation.py
+    import os
+    import requests
+    from config import Config
+    
+    
+    class TranslationService:
+    def __init__(self):
+    self.api_key = Config.DEEPL_API_KEY
+    self.url = "https://api-free.deepl.com/v2/translate"
+    self.cache = {}
+    
+    def translate(
+    self, text: str, source_lang: str = None, target_lang: str = "SV"
+    ) -> str:
+    """
+    Translate text from source_lang to target_lang using DeepL.
+    Returns the translated text or raises an exception if it fails.
+    """
+    if not text:
+    return ""
+    
+    # Check if we have a valid API key
+    if not self.api_key:
+    raise ValueError(
+    "DeepL API key is not set. Please configure DEEPL_API_KEY."
+    )
+    
+    cache_key = (text, source_lang or "", target_lang)
+    if cache_key in self.cache:
+    return self.cache[cache_key]
+    
+    data = {"auth_key": self.api_key, "text": text, "target_lang": target_lang}
+    if source_lang:
+    data["source_lang"] = source_lang
+    
+    resp = requests.post(self.url, data=data)
+    if resp.status_code != 200:
+    raise RuntimeError(
+    f"DeepL Translation failed: {resp.status_code} - {resp.text}"
+    )
+    
+    result_json = resp.json()
+    if "translations" not in result_json or not result_json["translations"]:
+    raise RuntimeError("DeepL response is missing 'translations' data.")
+    
+    translated = result_json["translations"][0]["text"]
+    self.cache[cache_key] = translated
+    return translated
+    ---
+  app.py
+    -- File Content --
+    # app.py
+    from flask import Flask
+    from flask_cors import CORS
+    from config import Config
+    from db import DBService
+    from api.translation import translation_bp
+    from api.fsrs import fsrs_bp
+    from api.dictionary import dictionary_bp
+    from alignment import AlignmentService
+    from translation import TranslationService
+    from app_fsrs import FSRS_Service
+    from vocabulary_lookup import VocabularyLookupService  # Import the new service
+    import nltk
+    
+    
+    def create_app():
+    app = Flask(__name__)
+    
+    # Enable CORS for all routes
+    CORS(app)
+    
+    # Initialize DB & create tables
+    app.db_service = DBService()
+    app.db_service.create_tables()
+    
+    # Initialize services
+    app.translation_service = TranslationService()
+    app.alignment_service = AlignmentService()
+    app.fsrs_service = FSRS_Service(app.db_service)
+    app.vocabulary_lookup_service = VocabularyLookupService(
+    app.db_service
+    )  # Initialize the new service
+    
+    with app.app_context():  # Ensure we have an application context
+    nltk.download("punkt", quiet=True)
+    nltk.download("wordnet", quiet=True)
+    nltk.download("omw-1.4", quiet=True)
+    
+    # Register Blueprints
+    app.register_blueprint(translation_bp, url_prefix="/api/translation")
+    app.register_blueprint(fsrs_bp, url_prefix="/api/fsrs")
+    app.register_blueprint(dictionary_bp, url_prefix="/api/dictionary")
+    
+    return app
+    
+    
+    if __name__ == "__main__":
+    app = create_app()
+    app.run(debug=True, port=5000)
+    ---
+  api
+    __init__.py
+      -- File Content --
+      ---
+    translation.py
+      -- File Content --
+      # api/translation.py
+      
+      from flask import Blueprint, request, jsonify, current_app
+      from http import HTTPStatus
+      import nltk
+      from nltk.stem import WordNetLemmatizer
+      
+      translation_bp = Blueprint("translation_bp", __name__)
+      
+      lemmatizer = WordNetLemmatizer()
+      
+      
+      @translation_bp.route("", methods=["POST"])
+      def translate_text():
+      """
+      POST /api/translation
+      Expects JSON:
+      {
+      "text": "Jag älskar dig",
+      "sourceLanguage": "SV",
+      "targetLanguage": "EN",
+      "splitSentences": true,
+      "markWords": true
+      }
+      Returns JSON with:
+      {
+      "originalText": ...,
+      "translatedText": ...,
+      "alignment": ...,
+      "sentences": [
+      {
+      "original": ...,
+      "translated": ...,
+      "src_tokenized": [...],
+      "trg_tokenized": [...],
+      "alignment": [(src_idx, trg_idx), ...],
+      "wordInfo": [
+      {
+      "original_word": "Jag",
+      "found_in_vocabulary": true/false,
+      "match_type": "direct"/"lemma"/...,
+      "vocabulary_entry": { ... } or null
+      },
+      ...
+      ]
+      },
+      ...
+      ]
+      }
+      """
+      
+      data = request.get_json()
+      if not data:
+      return jsonify({"error": "Missing JSON body"}), HTTPStatus.BAD_REQUEST
+      
+      text = data.get("text", "").strip()
+      source_lang = data.get("sourceLanguage", "").upper()  # e.g. "SV"
+      target_lang = data.get("targetLanguage", "").upper()  # e.g. "EN"
+      split_sentences = data.get("splitSentences", True)
+      mark_words = data.get("markWords", True)
+      
+      if not text:
+      return (
+      jsonify({"error": "Field 'text' cannot be empty."}),
+      HTTPStatus.BAD_REQUEST,
+      )
+      
+      try:
+      # 1) Translate the full text from source_lang -> target_lang
+      translated_text = current_app.translation_service.translate(
+      text, source_lang=source_lang, target_lang=target_lang
+      )
+      
+      # 2) Split text into sentences if requested
+      if split_sentences:
+      original_sentences = nltk.sent_tokenize(text)
+      translated_sentences = nltk.sent_tokenize(translated_text)
+      else:
+      original_sentences = [text]
+      translated_sentences = [translated_text]
+      
+      results = []
+      # 3) For each (original, translated) sentence pair:
+      for idx, (orig, tran) in enumerate(
+      zip(original_sentences, translated_sentences)
+      ):
+      # Use alignment service to get tokenization & alignment
+      align_data = current_app.alignment_service.align(orig, tran)
+      # align_data = {
+      #    "src_tokenized": [...],
+      #    "trg_tokenized": [...],
+      #    "alignment": [(src_idx, trg_idx), ...]
+      # }
+      
+      # 4) If markWords == True, look up the source tokens in the vocabulary
+      #    because the source language is the one we're learning
+      word_info_list = []
+      if mark_words:
+      for token in align_data["src_tokenized"]:
+      info = current_app.vocabulary_lookup_service.lookup_word(
+      token, source_lang
+      )
+      # info has keys: "original_word", "found_in_vocabulary", "match_type", etc.
+      word_info_list.append(info)
+      
+      results.append(
+      {
+      "original": orig,
+      "translated": tran,
+      "src_tokenized": align_data["src_tokenized"],
+      "trg_tokenized": align_data["trg_tokenized"],
+      "alignment": align_data["alignment"],
+      "wordInfo": word_info_list,
+      }
+      )
+      
+      # 5) Build the final response
+      response_data = {
+      "originalText": text,
+      "translatedText": translated_text,
+      "alignment": (
+      [r["alignment"] for r in results]
+      if split_sentences
+      else results[0]["alignment"]
+      ),
+      "sentences": results if split_sentences else [results[0]],
+      }
+      
+      # If not splitting, remove the array of sentences to keep it consistent
+      if not split_sentences:
+      del response_data["sentences"]
+      
+      return jsonify(response_data), HTTPStatus.OK
+      
+      except Exception as e:
+      return jsonify({"error": str(e)}), HTTPStatus.INTERNAL_SERVER_ERROR
+      ---
+    dictionary.py
+      -- File Content --
+      # api/dictionary.py
+      
+      from flask import Blueprint, request, jsonify, current_app
+      from http import HTTPStatus
+      
+      dictionary_bp = Blueprint("dictionary_bp", __name__)
+      
+      
+      @dictionary_bp.route("/lookup", methods=["GET"])
+      def lookup_word():
+      """
+      GET /api/dictionary/lookup?word=...&language=...
+      Returns JSON:
+      {
+      "word": "...",
+      "language": "...",
+      "translation": "..."
+      }
+      
+      We can rely on current_app.translation_service.translate(...)
+      or a specialized dictionary API call if you prefer.
+      """
+      word = request.args.get("word", "").strip()
+      language = request.args.get("language", "").strip()  # e.g., "sv"
+      
+      if not word or not language:
+      return (
+      jsonify({"error": "Missing 'word' or 'language' query param"}),
+      HTTPStatus.BAD_REQUEST,
+      )
+      
+      # Let's call the existing translationService with target_lang=EN for simplicity,
+      # or you can do a specialized dictionary approach.
+      try:
+      # We'll do a minimal 1-word translation, sourceLang= e.g. 'SV', targetLang='EN'
+      translated = current_app.translation_service.translate(
+      word, source_lang=language.upper(), target_lang="EN"
+      )
+      return (
+      jsonify({"word": word, "language": language, "translation": translated}),
+      HTTPStatus.OK,
+      )
+      except Exception as e:
+      return jsonify({"error": str(e)}), HTTPStatus.INTERNAL_SERVER_ERROR
+      ---
+    fsrs.py
+      -- File Content --
+      # api/fsrs.py
+      from flask import Blueprint, request, jsonify, current_app
+      from http import HTTPStatus
+      
+      fsrs_bp = Blueprint("fsrs_bp", __name__)
+      
+      
+      @fsrs_bp.route("/update", methods=["POST"])
+      def update_fsrs_data():
+      """
+      POST /api/fsrs/update
+      Expects JSON:
+      {
+      "word": "example",
+      "language": "sv",
+      "response": "good"  // again|hard|good|easy
+      }
+      """
+      data = request.get_json()
+      if not data:
+      return jsonify({"error": "Missing JSON body"}), HTTPStatus.BAD_REQUEST
+      
+      word = data.get("word")
+      language = data.get("language")
+      response = data.get("response")
+      
+      # Validate input
+      if not word or not language or not response:
+      return (
+      jsonify({"error": "Required fields: word, language, response"}),
+      HTTPStatus.BAD_REQUEST,
+      )
+      
+      try:
+      updated_vocab = current_app.fsrs_service.review_word(word, language, response)
+      if not updated_vocab:
+      return (
+      jsonify({"error": "Word not found in vocabulary"}),
+      HTTPStatus.NOT_FOUND,
+      )
+      
+      return (
+      jsonify(
+      {
+      "status": "success",
+      "message": f"FSRS data updated for word '{word}'.",
+      }
+      ),
+      HTTPStatus.OK,
+      )
+      
+      except ValueError as ve:
+      return jsonify({"error": str(ve)}), HTTPStatus.BAD_REQUEST
+      except Exception as e:
+      return jsonify({"error": str(e)}), HTTPStatus.INTERNAL_SERVER_ERROR
+      
+      
+      @fsrs_bp.route("/review", methods=["GET"])
+      def get_review_words():
+      """
+      GET /api/fsrs/review
+      Returns JSON of words that are due for review
+      """
+      try:
+      words = current_app.fsrs_service.get_words_due_for_review()
+      return jsonify({"words": words}), HTTPStatus.OK
+      except Exception as e:
+      return jsonify({"error": str(e)}), HTTPStatus.INTERNAL_SERVER_ERROR
+      
+      
+      @fsrs_bp.route("/vocabulary/import", methods=["POST"])
+      def import_wordlist():
+      """
+      POST /api/fsrs/vocabulary/import
+      Expects JSON:
+      {
+      "language": "sv",
+      "level": "A1",
+      "wordList": ["hej", "tack", "snälla"]
+      }
+      """
+      data = request.get_json()
+      if not data:
+      return jsonify({"error": "Missing JSON body"}), HTTPStatus.BAD_REQUEST
+      
+      language = data.get("language")
+      level = data.get("level")
+      word_list = data.get("wordList") or []
+      
+      # Validate input
+      if not language or not level or not isinstance(word_list, list):
+      return (
+      jsonify(
+      {
+      "error": "Fields 'language', 'level' and 'wordList' (as list) are required."
+      }
+      ),
+      HTTPStatus.BAD_REQUEST,
+      )
+      
+      try:
+      current_app.fsrs_service.import_word_list(language, level, word_list)
+      return (
+      jsonify(
+      {
+      "status": "success",
+      "message": f"Word list imported for language '{language.upper()}', level '{level.upper()}'.",
+      }
+      ),
+      HTTPStatus.OK,
+      )
+      except Exception as e:
+      return jsonify({"error": str(e)}), HTTPStatus.INTERNAL_SERVER_ERROR
+      
+      
+      @fsrs_bp.route("/vocabulary/learning_list", methods=["GET"])
+      def get_learning_list():
+      """
+      GET /api/fsrs/vocabulary/learning_list?language=sv&level=A1
+      """
+      language = request.args.get("language")
+      level = request.args.get("level")
+      
+      # Validate input
+      if not language or not level:
+      return (
+      jsonify({"error": "Query parameters 'language' and 'level' are required."}),
+      HTTPStatus.BAD_REQUEST,
+      )
+      
+      try:
+      words = current_app.fsrs_service.get_learning_list(language, level)
+      return jsonify({"words": words}), HTTPStatus.OK
+      except Exception as e:
+      return jsonify({"error": str(e)}), HTTPStatus.INTERNAL_SERVER_ERROR
+      
+      
+      @fsrs_bp.route("/vocabulary", methods=["GET"])
+      def get_vocabulary():
+      """
+      GET /api/fsrs/vocabulary
+      Returns the full user vocabulary with FSRS fields.
+      """
+      try:
+      vocab = current_app.fsrs_service.get_all_vocabulary()
+      return jsonify({"words": vocab}), HTTPStatus.OK
+      except Exception as e:
+      return jsonify({"error": str(e)}), HTTPStatus.INTERNAL_SERVER_ERROR
+      
+      
+      @fsrs_bp.route("/vocabulary/add", methods=["POST"])
+      def add_word():
+      """
+      POST /api/fsrs/vocabulary/add
+      Expects JSON:
+      {
+      "word": "minnas",
+      "language": "sv",
+      "translation": "to remember"
+      }
+      """
+      data = request.get_json()
+      if not data:
+      return jsonify({"error": "Missing JSON body"}), HTTPStatus.BAD_REQUEST
+      
+      word = data.get("word")
+      language = data.get("language")
+      translation = data.get("translation") or ""
+      
+      # Validate input
+      if not word or not language:
+      return (
+      jsonify({"error": "Fields 'word' and 'language' are required."}),
+      HTTPStatus.BAD_REQUEST,
+      )
+      
+      try:
+      current_app.fsrs_service.add_word(word, language, translation)
+      return (
+      jsonify(
+      {"status": "success", "message": f"Word '{word}' added to vocabulary."}
+      ),
+      HTTPStatus.OK,
+      )
+      except Exception as e:
+      return jsonify({"error": str(e)}), HTTPStatus.INTERNAL_SERVER_ERROR
+      
+      
+      @fsrs_bp.route("/vocabulary/lookup", methods=["GET"])
+      def lookup_fsrs_word():
+      """
+      GET /api/fsrs/vocabulary/lookup?word=...&language=...
+      Returns JSON:
+      {
+      "word": "älskar",
+      "language": "sv",
+      "translation": "love",
+      "state": 1,
+      "due": "...",
+      "stability": 0.0,
+      "difficulty": 0.0,
+      "last_review": "...",
+      "step": 0
+      }
+      or 404 if not found
+      """
+      from models import Vocabulary
+      
+      word = request.args.get("word", "").strip().lower()
+      language = request.args.get("language", "").strip().lower()
+      
+      if not word or not language:
+      return (
+      jsonify({"error": "Missing 'word' or 'language' query parameter"}),
+      HTTPStatus.BAD_REQUEST,
+      )
+      
+      session = current_app.db_service.get_session()
+      try:
+      vocab = session.get(Vocabulary, (word, language))
+      if not vocab:
+      return jsonify({"error": "Not found"}), HTTPStatus.NOT_FOUND
+      
+      return (
+      jsonify(
+      {
+      "word": vocab.word,
+      "language": vocab.language,
+      "translation": vocab.translation,
+      "state": vocab.state,
+      "due": vocab.due.isoformat() if vocab.due else None,
+      "stability": vocab.stability,
+      "difficulty": vocab.difficulty,
+      "last_review": (
+      vocab.last_review.isoformat() if vocab.last_review else None
+      ),
+      "step": vocab.step,
+      }
+      ),
+      HTTPStatus.OK,
+      )
+      
+      finally:
+      session.close()
+      ---
