@@ -9,7 +9,7 @@ from sqlalchemy import (
     ForeignKeyConstraint,
 )
 from sqlalchemy.orm import declarative_base, relationship
-from datetime import datetime
+from datetime import datetime, timezone
 
 Base = declarative_base()
 
@@ -49,7 +49,9 @@ class ReviewHistory(Base):
     __tablename__ = "review_history"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    review_time = Column(DateTime, nullable=False, default=datetime.utcnow)
+    review_time = Column(
+        DateTime, nullable=False, default=lambda: datetime.now(timezone.utc)
+    )
     word = Column(String, nullable=False)
     language = Column(String, nullable=False)
     rating = Column(Integer, nullable=False)  # 1=Again, 2=Hard, 3=Good, 4=Easy

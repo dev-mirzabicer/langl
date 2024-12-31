@@ -30,7 +30,12 @@ class TranslationService:
         if cache_key in self.cache:
             return self.cache[cache_key]
 
-        data = {"auth_key": self.api_key, "text": text, "target_lang": target_lang}
+        data = {
+            "auth_key": self.api_key,
+            "text": text,
+            "target_lang": target_lang,
+            "source_lang": source_lang,
+        }
         if source_lang:
             data["source_lang"] = source_lang
 
